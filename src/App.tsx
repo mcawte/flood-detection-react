@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import { fromArrayBuffer, GeoTIFF } from 'geotiff'; // Removed unused TypedArray import
+import { fromArrayBuffer, GeoTIFF } from 'geotiff';
 
 // Define an interface for better type safety
 interface ImageMetadata {
@@ -15,27 +15,37 @@ interface ImageMetadata {
 }
 
 function App() {
-  const [geoTiff, setGeoTiff] = useState<GeoTIFF | null>(null); // Use GeoTIFF type
-  const [imageMetadata, setImageMetadata] = useState<ImageMetadata | null>(null); // Use ImageMetadata type
+  const [geoTiff, setGeoTiff] = useState<GeoTIFF | null>(null);
+  const [imageMetadata, setImageMetadata] = useState<ImageMetadata | null>(null);
   const [mapInstance, setMapInstance] = useState<L.Map | null>(null);
   const [imageOverlay, setImageOverlay] = useState<L.ImageOverlay | null>(null);
   const mapContainerRef = useRef<HTMLDivElement>(null);
+  const mapInitializedRef = useRef<boolean>(false);
 
   // Initialize Leaflet map
   useEffect(() => {
-    if (mapContainerRef.current && !mapInstance) {
-      const map = L.map(mapContainerRef.current).setView([0, 0], 2); // Default view
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-      }).addTo(map);
-      setMapInstance(map);
+    // Use a ref to track initialization status
+    if (mapContainerRef.current && !mapInitializedRef.current) {
+      mapInitializedRef.current = true;
+      
+      try {
+        const map = L.map(mapContainerRef.current).setView([0, 0], 2); // Default view
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+        setMapInstance(map);
+        
+        // Cleanup map instance on component unmount
+        return () => {
+          map.remove();
+          mapInitializedRef.current = false;
+        };
+      } catch (error) {
+        console.error("Error initializing map:", error);
+        mapInitializedRef.current = false;
+      }
     }
-
-    // Cleanup map instance on component unmount
-    return () => {
-      mapInstance?.remove();
-    };
-  }, [mapContainerRef.current]); // Re-run if map container ref changes
+  }, []); // Empty dependency array - run only once on mount
 
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -102,16 +112,16 @@ function App() {
               const dataIndex = i * 4;
 
               // Example styling: Red for flood (value 1), transparent otherwise
-            if (pixelValue === 1) { // Adjust this condition based on your mask values
-              data[dataIndex] = 255;     // R
-              data[dataIndex + 1] = 0;   // G
-              data[dataIndex + 2] = 0;   // B
-              data[dataIndex + 3] = 150; // A (semi-transparent)
-            } else {
-              // Make other areas transparent
-              data[dataIndex + 3] = 0;   // A
+              if (pixelValue === 1) { // Adjust this condition based on your mask values
+                data[dataIndex] = 255;     // R
+                data[dataIndex + 1] = 0;   // G
+                data[dataIndex + 2] = 0;   // B
+                data[dataIndex + 3] = 150; // A (semi-transparent)
+              } else {
+                // Make other areas transparent
+                data[dataIndex + 3] = 0;   // A
+              }
             }
-          }
             ctx.putImageData(imageData, 0, 0);
           } // End of else block for type guard
 
@@ -119,12 +129,14 @@ function App() {
           const imageUrl = canvas.toDataURL();
           const leafletBounds = L.latLngBounds(boundsLatLng); // Create LatLngBounds object
 
+          // Remove old overlay if it exists
           if (imageOverlay) {
-            imageOverlay.setUrl(imageUrl).setBounds(leafletBounds);
-          } else {
-            const newOverlay = L.imageOverlay(imageUrl, leafletBounds, { opacity: 0.7 }).addTo(mapInstance);
-            setImageOverlay(newOverlay);
+            imageOverlay.remove();
           }
+          
+          // Create new overlay
+          const newOverlay = L.imageOverlay(imageUrl, leafletBounds, { opacity: 0.7 }).addTo(mapInstance);
+          setImageOverlay(newOverlay);
 
           // 6. Fit Map to Bounds
           mapInstance.flyToBounds(leafletBounds); // Use LatLngBounds object
@@ -147,25 +159,69 @@ function App() {
   };
 
   // Function to calculate flood area (basic example)
-  const calculateFloodArea = () => {
+  const calculateFloodArea = async () => {
     if (!imageMetadata || !geoTiff) return 'N/A';
 
-    // This is a very simplified calculation assuming pixels are square
-    // and the CRS is projected (like UTM) where units are meters.
-    // For geographic CRS (lat/lon), area calculation is more complex.
-    // Also assumes band 0 is the flood mask and value 1 indicates flood.
-    // A proper implementation needs CRS handling and accurate pixel area calculation.
+    try {
+      // Get the first image
+      const image = await geoTiff.getImage();
+      
+      // Read the raster data
+      const rasters = await image.readRasters({ window: [0, 0, imageMetadata.width, imageMetadata.height] });
+      const bandData = rasters[0];
+      
+      // Count flood pixels (value 1)
+      let floodPixelCount = 0;
+      
+      // Add type guard to handle potential 'number' type for bandData
+      if (typeof bandData === 'number') {
+        console.warn("Band data is a single number:", bandData, "- Cannot calculate area.");
+        return 'Cannot calculate (invalid data)';
+      } else {
+        // Count pixels with value 1 (flood)
+        for (let i = 0; i < bandData.length; i++) {
+          if (bandData[i] === 1) floodPixelCount++;
+        }
+        
+        // Calculate pixel area in square meters (assuming projected CRS)
+        const pixelArea = Math.abs(imageMetadata.resolution[0] * imageMetadata.resolution[1]);
+        
+        // Calculate total flood area
+        const totalFloodArea = floodPixelCount * pixelArea; // In native CRS units (e.g., m²)
+        
+        // Convert to km²
+        const floodAreaKm2 = totalFloodArea / 1_000_000;
+        
+        return `${floodAreaKm2.toFixed(2)} km² (approx.)`;
+      }
+    } catch (error) {
+      console.error('Error calculating flood area:', error);
+      return 'Calculation error';
+    }
+  };
 
-    // Placeholder: Count flood pixels (value 1)
-    // let floodPixelCount = 0;
-    // const bandData = ... // Need to re-read or store band data
-    // bandData.forEach(val => { if (val === 1) floodPixelCount++; });
-    // const pixelArea = Math.abs(metadata.resolution[0] * metadata.resolution[1]); // Area per pixel
-    // const totalFloodArea = floodPixelCount * pixelArea; // In native CRS units (e.g., m^2)
-    // const floodAreaKm2 = totalFloodArea / 1_000_000;
-    // return `${floodAreaKm2.toFixed(2)} km² (approx.)`;
+  const [floodAreaDisplay, setFloodAreaDisplay] = useState<string>('N/A');
+  
+  // Update flood area when image metadata changes
+  useEffect(() => {
+    const updateFloodArea = async () => {
+      const area = await calculateFloodArea();
+      setFloodAreaDisplay(area);
+    };
+    
+    if (imageMetadata && geoTiff) {
+      updateFloodArea();
+    }
+  }, [imageMetadata, geoTiff]);
 
-    return 'Calculation needs implementation'; // Placeholder
+  const toggleOverlay = () => {
+    if (!mapInstance || !imageOverlay) return;
+    
+    if (mapInstance.hasLayer(imageOverlay)) {
+      imageOverlay.remove();
+    } else {
+      imageOverlay.addTo(mapInstance);
+    }
   };
 
   return (
@@ -209,9 +265,9 @@ function App() {
                 <li><strong>Height:</strong> {imageMetadata.height} px</li>
                 <li><strong>Bands:</strong> {imageMetadata.bands}</li>
                 <li><strong>CRS:</strong> {imageMetadata.crs}</li>
-                <li><strong>Bounds:</strong> {JSON.stringify(imageMetadata.bounds)}</li>
-                {/* Add more metadata fields */}
-                <li><strong>Flood Area:</strong> {calculateFloodArea()}</li>
+                <li><strong>Bounds:</strong> [{imageMetadata.bounds.map(b => b.toFixed(4)).join(', ')}]</li>
+                <li><strong>Resolution:</strong> [{imageMetadata.resolution.map(r => r.toFixed(6)).join(', ')}]</li>
+                <li><strong>Flood Area:</strong> {floodAreaDisplay}</li>
               </ul>
             </div>
           )}
@@ -228,17 +284,10 @@ function App() {
              </div>
           )}
 
-           {/* Overlay Toggle (Example) */}
+           {/* Overlay Toggle */}
            {imageOverlay && mapInstance && (
              <button
-               onClick={() => {
-                 if (mapInstance.hasLayer(imageOverlay)) {
-                   imageOverlay.remove();
-                 } else {
-                   imageOverlay.addTo(mapInstance);
-                 }
-                 // Force re-render or update state to change button text if needed
-               }}
+               onClick={toggleOverlay}
                className="w-full bg-yellow-500 hover:bg-yellow-600 text-white font-bold py-2 px-4 rounded transition duration-150 ease-in-out"
              >
                Toggle Flood Overlay
